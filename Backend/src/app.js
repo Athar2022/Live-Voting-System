@@ -16,6 +16,9 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// Store socket.io instance in app
+app.set('socketio', require('./utils/socket').getIO());
+
 // Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/polls', require('./routes/polls'));
