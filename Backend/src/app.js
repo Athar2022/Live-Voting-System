@@ -23,6 +23,8 @@ app.set('socketio', require('./utils/socket').getIO());
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/polls', require('./routes/polls'));
 app.use('/api/votes', require('./routes/votes'));
+app.use('/api/stats', require('./routes/stats'));
+
 
 // Health check
 app.get('/api/health', (req, res) => {
