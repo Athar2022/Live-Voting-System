@@ -1,5 +1,6 @@
 const Poll = require('../models/Poll');
 const { validationResult } = require('express-validator');
+const RealTimeService = require('../utils/realTimeService');
 
 // Create new poll
 exports.createPoll = async (req, res) => {
@@ -40,6 +41,9 @@ exports.createPoll = async (req, res) => {
     }
 
     const poll = await Poll.create(pollData);
+
+    // Emit real-time notification about new poll
+    RealTimeService.emitNewPoll(poll);
 
     res.status(201).json({
       status: 'success',
@@ -87,6 +91,11 @@ exports.getPolls = async (req, res) => {
         { isClosed: true },
         { closesAt: { $lte: new Date() } }
       ];
+    }
+
+    // Only show public polls to non-owners unless specified
+    if (req.query.userId !== req.user.id && req.user.role !== 'admin') {
+      filter.isPublic = true;
     }
 
     // Get polls with population
@@ -139,6 +148,14 @@ exports.getPoll = async (req, res) => {
       return res.status(404).json({
         status: 'error',
         message: 'Poll not found'
+      });
+    }
+
+    // Check if user can access private poll
+    if (!poll.isPublic && poll.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Not authorized to access this poll'
       });
     }
 
@@ -248,6 +265,9 @@ exports.deletePoll = async (req, res) => {
     poll.isActive = false;
     await poll.save();
 
+    // Emit real-time notification about poll deletion
+    RealTimeService.emitPollDeleted(poll._id, poll.title, req.user.username);
+
     res.status(200).json({
       status: 'success',
       message: 'Poll deleted successfully'
@@ -290,6 +310,9 @@ exports.closePoll = async (req, res) => {
     }
 
     await poll.closePoll();
+
+    // Emit real-time notification about poll closure
+    RealTimeService.emitPollClosed(poll);
 
     res.status(200).json({
       status: 'success',
@@ -342,6 +365,138 @@ exports.getMyPolls = async (req, res) => {
     res.status(500).json({
       status: 'error',
       message: 'Error fetching your polls',
+      error: error.message
+    });
+  }
+};
+
+// Get poll statistics
+exports.getPollStats = async (req, res) => {
+  try {
+    const pollId = req.params.id;
+    
+    const poll = await Poll.findById(pollId);
+    if (!poll || !poll.isActive) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Poll not found'
+      });
+    }
+
+    // Check if user can access poll stats
+    if (poll.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Not authorized to view statistics for this poll'
+      });
+    }
+
+    const Vote = require('../models/Vote');
+    
+    // Get vote distribution over time
+    const votesOverTime = await Vote.aggregate([
+      { $match: { poll: poll._id } },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: "%Y-%m-%d", date: "$votedAt" }
+          },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    // Get option popularity
+    const optionStats = poll.options.map((option, index) => ({
+      index,
+      text: option.text,
+      votes: option.votes,
+      percentage: poll.totalVotes > 0 
+        ? Math.round((option.votes / poll.totalVotes) * 100) 
+        : 0
+    }));
+
+    const stats = {
+      poll: {
+        id: poll._id,
+        title: poll.title,
+        totalVotes: poll.totalVotes,
+        isClosed: poll.isClosed,
+        createdAt: poll.createdAt,
+        closesAt: poll.closesAt
+      },
+      optionStats,
+      votesOverTime,
+      participationRate: poll.totalVotes > 0 ? 'high' : 'low' // This can be enhanced with user base data
+    };
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        stats
+      }
+    });
+  } catch (error) {
+    console.error('Get poll stats error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error fetching poll statistics',
+      error: error.message
+    });
+  }
+};
+
+// Reopen a closed poll
+exports.reopenPoll = async (req, res) => {
+  try {
+    const poll = await Poll.findById(req.params.id);
+
+    if (!poll) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Poll not found'
+      });
+    }
+
+    // Check if user owns the poll or is admin
+    if (poll.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Not authorized to reopen this poll'
+      });
+    }
+
+    if (!poll.isClosed) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Poll is already open'
+      });
+    }
+
+    // Check if poll expiration date is in the past
+    if (poll.closesAt && poll.closesAt <= new Date()) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Cannot reopen an expired poll'
+      });
+    }
+
+    poll.isClosed = false;
+    await poll.save();
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Poll reopened successfully',
+      data: {
+        poll
+      }
+    });
+  } catch (error) {
+    console.error('Reopen poll error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error reopening poll',
       error: error.message
     });
   }

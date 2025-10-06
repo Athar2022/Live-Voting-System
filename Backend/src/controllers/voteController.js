@@ -1,6 +1,7 @@
 const Vote = require('../models/Vote');
 const Poll = require('../models/Poll');
 const { validationResult } = require('express-validator');
+const RealTimeService = require('../utils/realTimeService');
 
 // Submit a vote
 exports.submitVote = async (req, res) => {
@@ -109,15 +110,8 @@ exports.submitVote = async (req, res) => {
         .populate('user', 'username email')
         .populate('poll', 'title options');
 
-      // Emit real-time update via Socket.io if available
-      if (req.app.get('socketio')) {
-        const voteResult = await this.getVoteResults(pollId);
-        req.app.get('socketio').to(`poll_${pollId}`).emit('voteUpdate', {
-          pollId,
-          results: voteResult,
-          totalVotes: poll.totalVotes
-        });
-      }
+      // Emit real-time notification
+      RealTimeService.emitVoteSubmitted(pollId, userId);
 
       res.status(201).json({
         status: 'success',
@@ -165,14 +159,25 @@ exports.getVoteResults = async (req, res) => {
       });
     }
 
-    // Check if user can view results (could add more complex logic here)
+    // Check if user can view results
     if (poll.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
-      // For public polls, allow viewing results
+      // For public polls, allow viewing results only if poll is closed or user has voted
       if (!poll.isPublic) {
         return res.status(403).json({
           status: 'error',
           message: 'Not authorized to view these results'
         });
+      }
+      
+      // For public active polls, check if user has voted or if results are public
+      if (!poll.isClosed) {
+        const userVote = await Vote.getUserVote(req.user.id, pollId);
+        if (!userVote) {
+          return res.status(403).json({
+            status: 'error',
+            message: 'You must vote first to see the results'
+          });
+        }
       }
     }
 
@@ -182,7 +187,8 @@ exports.getVoteResults = async (req, res) => {
         title: poll.title,
         totalVotes: poll.totalVotes,
         isClosed: poll.isClosed,
-        allowMultiple: poll.allowMultiple
+        allowMultiple: poll.allowMultiple,
+        createdBy: poll.createdBy
       },
       options: poll.options.map((option, index) => ({
         index,
@@ -229,8 +235,12 @@ exports.getUserVotes = async (req, res) => {
     const votes = await Vote.find({ user: req.user.id })
       .populate({
         path: 'poll',
-        select: 'title description isActive isClosed totalVotes createdAt',
-        match: { isActive: true }
+        select: 'title description isActive isClosed totalVotes createdAt closesAt',
+        match: { isActive: true },
+        populate: {
+          path: 'createdBy',
+          select: 'username'
+        }
       })
       .sort({ votedAt: -1 })
       .skip(skip)
@@ -310,8 +320,7 @@ exports.withdrawVote = async (req, res) => {
       });
     }
 
-    // Check if poll allows vote withdrawal (you can add this field to Poll model)
-    // For now, we'll allow it only if the poll is still active and not closed
+    // Check if poll allows vote withdrawal
     if (!poll.canVote()) {
       return res.status(400).json({
         status: 'error',
@@ -346,14 +355,7 @@ exports.withdrawVote = async (req, res) => {
       session.endSession();
 
       // Emit real-time update
-      if (req.app.get('socketio')) {
-        const voteResult = await this.getVoteResults(pollId);
-        req.app.get('socketio').to(`poll_${pollId}`).emit('voteUpdate', {
-          pollId,
-          results: voteResult,
-          totalVotes: poll.totalVotes
-        });
-      }
+      RealTimeService.emitVoteSubmitted(pollId, userId);
 
       res.status(200).json({
         status: 'success',
@@ -371,6 +373,199 @@ exports.withdrawVote = async (req, res) => {
     res.status(500).json({
       status: 'error',
       message: 'Error withdrawing vote',
+      error: error.message
+    });
+  }
+};
+
+// Get detailed vote analytics for a poll (admin/owner only)
+exports.getVoteAnalytics = async (req, res) => {
+  try {
+    const pollId = req.params.pollId;
+
+    const poll = await Poll.findById(pollId);
+    if (!poll || !poll.isActive) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Poll not found'
+      });
+    }
+
+    // Check if user owns the poll or is admin
+    if (poll.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Not authorized to view analytics for this poll'
+      });
+    }
+
+    // Get votes with user information
+    const votes = await Vote.find({ poll: pollId })
+      .populate('user', 'username email')
+      .sort({ votedAt: -1 });
+
+    // Get vote distribution by time
+    const votesByHour = await Vote.aggregate([
+      { $match: { poll: poll._id } },
+      {
+        $group: {
+          _id: { $hour: "$votedAt" },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    // Get option popularity over time
+    const optionTrends = await Vote.aggregate([
+      { $match: { poll: poll._id } },
+      {
+        $unwind: "$selectedOptions"
+      },
+      {
+        $group: {
+          _id: {
+            option: "$selectedOptions",
+            date: { $dateToString: { format: "%Y-%m-%d", date: "$votedAt" } }
+          },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: "$_id.option",
+          trends: {
+            $push: {
+              date: "$_id.date",
+              votes: "$count"
+            }
+          }
+        }
+      }
+    ]);
+
+    const analytics = {
+      poll: {
+        id: poll._id,
+        title: poll.title,
+        totalVotes: poll.totalVotes,
+        createdAt: poll.createdAt,
+        closesAt: poll.closesAt,
+        isClosed: poll.isClosed
+      },
+      votes: votes.map(vote => ({
+        user: {
+          username: vote.user.username,
+          email: vote.user.email
+        },
+        selectedOptions: vote.selectedOptions,
+        votedAt: vote.votedAt
+      })),
+      votesByHour,
+      optionTrends,
+      summary: {
+        averageOptionsPerVote: poll.allowMultiple ? 
+          (votes.reduce((sum, vote) => sum + vote.selectedOptions.length, 0) / votes.length).toFixed(2) : 1,
+        mostPopularOption: poll.options.reduce((max, option, index) => 
+          option.votes > max.votes ? { index, ...option.toObject() } : max, 
+          { index: 0, votes: -1 }
+        ),
+        voteRatePerHour: votes.length > 0 ? 
+          (votes.length / ((new Date() - poll.createdAt) / (1000 * 60 * 60))).toFixed(2) : 0
+      }
+    };
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        analytics
+      }
+    });
+
+  } catch (error) {
+    console.error('Get vote analytics error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error fetching vote analytics',
+      error: error.message
+    });
+  }
+};
+
+// Export poll votes data (admin/owner only)
+exports.exportVotes = async (req, res) => {
+  try {
+    const pollId = req.params.pollId;
+    const format = req.query.format || 'json';
+
+    const poll = await Poll.findById(pollId);
+    if (!poll || !poll.isActive) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Poll not found'
+      });
+    }
+
+    // Check if user owns the poll or is admin
+    if (poll.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Not authorized to export votes for this poll'
+      });
+    }
+
+    const votes = await Vote.find({ poll: pollId })
+      .populate('user', 'username email')
+      .sort({ votedAt: -1 });
+
+    if (format === 'csv') {
+      // Convert to CSV format
+      const csvHeaders = ['Username', 'Email', 'Selected Options', 'Voted At'];
+      const csvData = votes.map(vote => [
+        vote.user.username,
+        vote.user.email,
+        vote.selectedOptions.map(opt => poll.options[opt].text).join('; '),
+        vote.votedAt.toISOString()
+      ]);
+
+      const csvContent = [csvHeaders, ...csvData]
+        .map(row => row.map(field => `"${field}"`).join(','))
+        .join('\n');
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="votes_${pollId}.csv"`);
+      return res.send(csvContent);
+    }
+
+    // Default JSON format
+    res.status(200).json({
+      status: 'success',
+      data: {
+        poll: {
+          id: poll._id,
+          title: poll.title,
+          description: poll.description
+        },
+        votes: votes.map(vote => ({
+          user: {
+            username: vote.user.username,
+            email: vote.user.email
+          },
+          selectedOptions: vote.selectedOptions.map(optIndex => ({
+            index: optIndex,
+            text: poll.options[optIndex].text
+          })),
+          votedAt: vote.votedAt
+        })),
+        exportDate: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Export votes error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error exporting votes',
       error: error.message
     });
   }
