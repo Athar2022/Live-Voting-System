@@ -25,6 +25,20 @@ class VoteService {
     const response = await api.delete(`/votes/${pollId}`)
     return response.data
   }
+
+  async getVoteAnalytics(pollId) {
+    const response = await api.get(`/votes/analytics/${pollId}`)
+    return response.data
+  }
+
+   async exportVotes(pollId, format = 'json') {
+    const response = await api.get(`/votes/export/${pollId}`, {
+      params: { format },
+      responseType: format === 'csv' ? 'blob' : 'json'
+    })
+    return response.data
+  }
 }
+
 
 export default new VoteService()
