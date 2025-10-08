@@ -12,13 +12,13 @@ const routes = [
     path: '/login',
     name: 'Login',
     component: () => import('@/views/LoginView.vue'),
-    meta: { requiresGuest: true }
+    meta: { requiresGuest: true, layout: 'empty' }
   },
   {
     path: '/register',
     name: 'Register',
     component: () => import('@/views/RegisterView.vue'),
-    meta: { requiresGuest: true }
+    meta: { requiresGuest: true, layout: 'empty' }
   },
   {
     path: '/polls',
